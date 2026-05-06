@@ -1,218 +1,609 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[codz]
-*$py.class
+#!/usr/bin/env python3
+"""
+╔═══════════════════════════════════════════════════════════════════╗
+║             CryptoCTF Solver  v1.0                                ║
+║  Automatic flag extraction from CTF cryptography challenges       ║
+║     Author: CyberShailendra                                       ║
+║  Usage:                                                           ║
+║    python Crypto-shail.py -f ciphertext.txt          # auto       ║
+║    python Crypto-shail.py -c "base64:ZmxhZ3t..."    # inline      ║
+║    python Crypto-shail.py -r host:1337               # remote     ║
+║    python Crypto-shail.py -f data.txt -t rsa         # forced     ║
+║    python Crypto-shail.py -f hash.txt --wordlist /path/rockyou    ║
+╚═══════════════════════════════════════════════════════════════════╝
+"""
 
-# C extensions
-*.so
+import os
+import sys
+import json
+import time
+import logging
+import argparse
+import binascii
+import textwrap
+from pathlib import Path
+from typing import Optional, List, Dict, Any, Tuple
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+# ── Module imports ────────────────────────────────────────────────────────────
+from modules.utils import (
+    extract_flags, print_flag, safe_decode, BANNER, int_to_bytes, bytes_to_int
+)
+from modules.detector import detect, DetectionResult
+from modules.encoding import try_all_encodings, decode_by_type
+from modules.classical import solve_classical, brute_caesar
+from modules.xor_attacks import solve_xor, single_byte_xor_results
+from modules.rsa_attacks import parse_rsa_params, solve_rsa, solve_hastad_from_list
+from modules.aes_attacks import solve_aes, detect_ecb
+from modules.hash_cracker import solve_hash, identify_hash
+from modules.ecc_dh import solve_ecc, solve_dh
 
-# PyInstaller
-#   Usually these files are written by a python script from a template
-#   before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+logger = logging.getLogger("cryptoctf")
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py.cover
-.hypothesis/
-.pytest_cache/
-cover/
+# ════════════════════════════════════════════════════════════════════════════
+# ── Pretty Printer ────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
 
-# Translations
-*.mo
-*.pot
+class Colors:
+    RED    = "\033[91m"
+    GREEN  = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE   = "\033[94m"
+    PURPLE = "\033[95m"
+    CYAN   = "\033[96m"
+    BOLD   = "\033[1m"
+    END    = "\033[0m"
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+def cprint(msg: str, color: str = "", bold: bool = False):
+    if sys.stdout.isatty():
+        prefix = (Colors.BOLD if bold else "") + color
+        print(prefix + msg + Colors.END)
+    else:
+        print(msg)
 
-# Flask stuff:
-instance/
-.webassets-cache
+def section(title: str):
+    bar = "─" * 58
+    cprint(f"\n┌{bar}┐", Colors.CYAN)
+    cprint(f"│  {title:<56}│", Colors.CYAN, bold=True)
+    cprint(f"└{bar}┘", Colors.CYAN)
 
-# Scrapy stuff:
-.scrapy
+def result_line(method: str, value: str, is_flag: bool = False):
+    color = Colors.GREEN if is_flag else Colors.YELLOW
+    tick  = "🚩" if is_flag else "  "
+    # Truncate long values for display
+    display = value[:100] + ("..." if len(value) > 100 else "")
+    cprint(f"  {tick} [{method}]", color, bold=is_flag)
+    cprint(f"      {display}", color)
 
-# Sphinx documentation
-docs/_build/
 
-# PyBuilder
-.pybuilder/
-target/
+# ════════════════════════════════════════════════════════════════════════════
+# ── Core Solver Logic ─────────────────────────────────════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 
-# Jupyter Notebook
-.ipynb_checkpoints
+class CryptoCTFSolver:
+    def __init__(self, args):
+        self.args = args
+        self.verbose = args.verbose
+        self.flag_pattern = args.flag_pattern
+        self.wordlist = args.wordlist
+        self.output_file = args.output
+        self.results: List[Tuple[str, str]] = []          # (method, value)
+        self.flags: List[str] = []
+        self.start_time = time.time()
 
-# IPython
-profile_default/
-ipython_config.py
+    # ── Helpers ───────────────────────────────────────────────────────────
+    def _check_flags(self, text: str, method: str) -> List[str]:
+        """Extract flags from text and record them."""
+        found = extract_flags(text, self.flag_pattern)
+        for f in found:
+            if f not in self.flags:
+                self.flags.append(f)
+                result_line(method, f, is_flag=True)
+        return found
 
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
+    def _record(self, method: str, value: str):
+        """Record a result and display it."""
+        self.results.append((method, value))
+        is_flag = bool(self._check_flags(value, method))
+        if not is_flag and self.verbose:
+            result_line(method, value)
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-# Pipfile.lock
+    def _save_output(self):
+        if not self.output_file:
+            return
+        try:
+            with open(self.output_file, "w") as f:
+                f.write(f"# CryptoCTF Solver results — {time.ctime()}\n\n")
+                if self.flags:
+                    f.write("## FLAGS\n")
+                    for flag in self.flags:
+                        f.write(f"  {flag}\n")
+                    f.write("\n")
+                f.write("## All results\n")
+                for method, value in self.results:
+                    f.write(f"[{method}]\n{value}\n\n")
+            cprint(f"\n  Results saved → {self.output_file}", Colors.BLUE)
+        except Exception as e:
+            logger.error(f"Cannot write output: {e}")
 
-# UV
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-# uv.lock
+    # ── Data loading ──────────────────────────────────────────────────────
+    def load_input(self) -> Tuple[str, bytes]:
+        """Load raw string and raw bytes from args."""
+        raw_str = ""
+        raw_bytes = b""
 
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-# poetry.lock
-# poetry.toml
+        if self.args.ciphertext:
+            raw_str = self.args.ciphertext
+            raw_bytes = raw_str.encode("latin-1", errors="replace")
 
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
-#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
-# pdm.lock
-# pdm.toml
-.pdm-python
-.pdm-build/
+        elif self.args.file:
+            path = Path(self.args.file)
+            if not path.exists():
+                cprint(f"ERROR: File not found: {path}", Colors.RED)
+                sys.exit(1)
+            raw_bytes = path.read_bytes()
+            raw_str = safe_decode(raw_bytes) or raw_bytes.hex()
+            cprint(f"  Loaded {len(raw_bytes)} bytes from {path}", Colors.BLUE)
 
-# pixi
-#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
-# pixi.lock
-#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
-#   in the .venv directory. It is recommended not to include this directory in version control.
-.pixi
+        return raw_str, raw_bytes
 
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
+    # ═══════════════════════════════════════════════════════════════════════
+    # ── Attack Dispatchers ─────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════
 
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
+    def _solve_encoding(self, raw: str):
+        section("ENCODING DETECTION")
+        all_results = try_all_encodings(raw)
+        for method, value in all_results:
+            self._record(method, value)
+            # Recursively try on decoded result
+            if value and value != raw and len(value) > 2:
+                inner_flags = extract_flags(value, self.flag_pattern)
+                if not inner_flags:
+                    inner = try_all_encodings(value)
+                    for m2, v2 in inner[:5]:
+                        self._record(f"{method}→{m2}", v2)
 
-# Redis
-*.rdb
-*.aof
-*.pid
+    def _solve_classical(self, raw: str):
+        section("CLASSICAL CIPHERS")
+        results = solve_classical(raw)
+        for method, plain, score in results[:10]:
+            if score > 0.5:  # minimum English-ness threshold
+                self._record(method, plain)
 
-# RabbitMQ
-mnesia/
-rabbitmq/
-rabbitmq-data/
+    def _solve_xor(self, raw_bytes: bytes, raw: str):
+        section("XOR ATTACKS")
+        results = solve_xor(
+            raw_bytes,
+            known_crib=self.args.crib,
+            other_ciphertexts=self._load_extra_ciphertexts(),
+        )
+        for method, plain in results:
+            self._record(method, plain)
 
-# ActiveMQ
-activemq-data/
+    def _load_extra_ciphertexts(self) -> Optional[List[bytes]]:
+        if not self.args.extra:
+            return None
+        result = []
+        for path in self.args.extra:
+            try:
+                result.append(Path(path).read_bytes())
+            except Exception:
+                pass
+        return result or None
 
-# SageMath parsed files
-*.sage.py
+    def _solve_rsa(self, raw: str, raw_bytes: bytes):
+        section("RSA ATTACKS")
+        params = parse_rsa_params(raw)
 
-# Environments
-.env
-.envrc
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
+        # Override / supplement with CLI args
+        if self.args.n: params["n"] = int(self.args.n, 0)
+        if self.args.e: params["e"] = int(self.args.e, 0)
+        if self.args.c: params["c"] = int(self.args.c, 0)
+        if self.args.p: params["p"] = int(self.args.p, 0)
+        if self.args.q: params["q"] = int(self.args.q, 0)
+        if self.args.d: params["d"] = int(self.args.d, 0)
 
-# Spyder project settings
-.spyderproject
-.spyproject
+        if not params:
+            cprint("  No RSA parameters found in input", Colors.YELLOW)
+            return
 
-# Rope project settings
-.ropeproject
+        cprint(f"  Parsed params: { {k: str(v)[:30] for k,v in params.items()} }", Colors.BLUE)
 
-# mkdocs documentation
-/site
+        result = solve_rsa(params, verbose=self.verbose)
+        if result:
+            self._record("rsa_decrypt", result)
 
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
+        # Hastad broadcast from multiple files
+        if self.args.extra and params.get("e"):
+            param_list = [params]
+            for path in self.args.extra:
+                try:
+                    extra_raw = Path(path).read_text()
+                    extra_params = parse_rsa_params(extra_raw)
+                    if extra_params:
+                        param_list.append(extra_params)
+                except Exception:
+                    pass
+            if len(param_list) >= params["e"]:
+                r2 = solve_hastad_from_list(param_list, params["e"])
+                if r2:
+                    self._record("hastad_broadcast", r2)
 
-# Pyre type checker
-.pyre/
+    def _solve_aes(self, raw_bytes: bytes, raw: str):
+        section("AES ANALYSIS")
+        if detect_ecb(raw_bytes):
+            cprint("  ⚠  ECB mode detected (repeated blocks)!", Colors.YELLOW, bold=True)
+            self._record("aes_ecb_detected", f"ECB mode: {len(raw_bytes)//16} blocks")
 
-# pytype static type analyzer
-.pytype/
+        params = {}
+        if self.args.key:    params["key"] = self.args.key
+        if self.args.iv:     params["iv"]  = self.args.iv
+        if self.args.mode:   params["mode"] = self.args.mode
 
-# Cython debug symbols
-cython_debug/
+        # Try to parse hex key/iv from text
+        import re
+        for kw in ("key", "Key", "KEY"):
+            m = re.search(rf"{kw}\s*[=:]\s*([0-9a-fA-F]{{32,64}})", raw)
+            if m and "key" not in params:
+                params["key"] = m.group(1)
+        for kw in ("iv", "IV", "nonce"):
+            m = re.search(rf"{kw}\s*[=:]\s*([0-9a-fA-F]{{32}})", raw)
+            if m and "iv" not in params:
+                params["iv"] = m.group(1)
 
-# PyCharm
-#   JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#   be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#   and can be added to the global gitignore or merged into this file.  For a more nuclear
-#   option (not recommended) you can uncomment the following to ignore the entire idea folder.
-# .idea/
+        result = solve_aes(raw_bytes, params)
+        if result:
+            self._record("aes_decrypt", result)
 
-# Abstra
-#   Abstra is an AI-powered process automation framework.
-#   Ignore directories containing user credentials, local state, and settings.
-#   Learn more at https://abstra.io/docs
-.abstra/
+    def _solve_hash(self, raw: str):
+        section("HASH CRACKING")
+        algo = identify_hash(raw.strip())
+        cprint(f"  Detected hash type: {algo.upper()}", Colors.BLUE)
+        result = solve_hash(
+            raw.strip(),
+            wordlist=self.wordlist,
+            brute=True,
+            online=not self.args.offline,
+            max_brute_len=self.args.brute_len,
+            algo=algo,
+        )
+        if result:
+            self._record(f"hash_cracked({algo})", result)
+        else:
+            cprint("  Hash could not be cracked with available methods", Colors.YELLOW)
 
-# Visual Studio Code
-#   Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
-#   that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#   and can be added to the global gitignore or merged into this file. However, if you prefer, 
-#   you could uncomment the following to ignore the entire vscode folder
-# .vscode/
-# Temporary file for partial code execution
-tempCodeRunnerFile.py
+    def _solve_ecc(self, raw: str):
+        section("ECC ATTACKS")
+        import re
+        params = {}
+        for key in ("p", "a", "b", "Gx", "Gy", "Qx", "Qy", "order", "n"):
+            m = re.search(rf"\b{key}\s*[=:]\s*(0x[0-9a-fA-F]+|\d+)", raw)
+            if m:
+                params[key] = int(m.group(1), 0)
+        if params:
+            result = solve_ecc(params)
+            if result is not None:
+                self._record("ecc_private_key", str(result))
+                # Try to decode as message
+                try:
+                    decoded = safe_decode(int_to_bytes(result))
+                    if decoded:
+                        self._record("ecc_decoded_message", decoded)
+                except Exception:
+                    pass
+        else:
+            cprint("  No ECC parameters found in input", Colors.YELLOW)
 
-# Ruff stuff:
-.ruff_cache/
+    def _solve_dh(self, raw: str):
+        section("DIFFIE-HELLMAN ATTACKS")
+        import re
+        params = {}
+        for key in ("p", "g", "A", "B", "order"):
+            m = re.search(rf"\b{key}\s*[=:]\s*(0x[0-9a-fA-F]+|\d+)", raw)
+            if m:
+                params[key] = int(m.group(1), 0)
+        if params:
+            result = solve_dh(params)
+            if result is not None:
+                self._record("dh_private_key", str(result))
+        else:
+            cprint("  No DH parameters found in input", Colors.YELLOW)
 
-# PyPI configuration file
-.pypirc
+    def _try_everything(self, raw: str, raw_bytes: bytes):
+        """Shotgun mode: try all attack families."""
+        section("AUTO-DETECT & SHOTGUN MODE")
+        detections = detect(raw, raw_bytes)
+        cprint(f"\n  Detection results:", Colors.BLUE)
+        for d in detections[:5]:
+            cprint(f"    [{d.confidence:.0%}] {d.crypto_type}/{d.subtype} — {d.notes}", Colors.BLUE)
 
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
+        # Always try encoding (many CTF challs layer encodings)
+        self._solve_encoding(raw)
+        if self.flags:
+            return
 
-# Streamlit
-.streamlit/secrets.toml
+        # Route based on top detection
+        top = detections[0] if detections else None
+        if top:
+            ct = top.crypto_type
+            if ct == "hash":
+                self._solve_hash(raw)
+            elif ct == "rsa":
+                self._solve_rsa(raw, raw_bytes)
+            elif ct == "aes":
+                self._solve_aes(raw_bytes, raw)
+            elif ct == "xor":
+                self._solve_xor(raw_bytes, raw)
+            elif ct == "classical":
+                self._solve_classical(raw)
+            elif ct == "encoding":
+                pass  # already done above
+
+        if not self.flags:
+            # Try remaining families
+            if len(raw_bytes) > 3:
+                self._solve_xor(raw_bytes, raw)
+            if not self.flags:
+                self._solve_classical(raw)
+            if not self.flags:
+                self._solve_rsa(raw, raw_bytes)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ── Remote Mode ────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+
+    def _solve_remote(self):
+        section("REMOTE CHALLENGE")
+        from modules.remote import auto_solve_remote
+
+        addr = self.args.remote
+        host, _, port_str = addr.rpartition(":")
+        if not host:
+            host, port_str = addr, "1337"
+        port = int(port_str)
+
+        cprint(f"  Target: {host}:{port}", Colors.BLUE)
+
+        def remote_solver(challenge_text: str) -> Optional[str]:
+            """Auto-solve the received challenge and return the answer."""
+            raw = challenge_text.strip()
+            raw_bytes = raw.encode("latin-1", errors="replace")
+
+            # Quick check for common CTF challenge types
+            detections = detect(raw, raw_bytes)
+            if not detections:
+                return None
+
+            top = detections[0]
+            ct = top.crypto_type
+            st = top.subtype
+
+            if ct == "encoding":
+                results = try_all_encodings(raw)
+                if results:
+                    return results[0][1]
+
+            elif ct == "hash":
+                return solve_hash(raw, wordlist=self.wordlist,
+                                  brute=True, online=not self.args.offline,
+                                  max_brute_len=self.args.brute_len)
+
+            elif ct == "rsa":
+                params = parse_rsa_params(raw)
+                return solve_rsa(params)
+
+            elif ct == "classical":
+                results = solve_classical(raw)
+                if results:
+                    return results[0][1]
+
+            elif ct == "xor":
+                results = solve_xor(raw_bytes)
+                if results:
+                    return results[0][1]
+
+            return None
+
+        flag = auto_solve_remote(
+            host, port,
+            solver=remote_solver,
+            flag_pattern=self.flag_pattern,
+            max_rounds=self.args.rounds,
+        )
+        if flag:
+            self.flags.append(flag)
+            result_line("remote_capture", flag, is_flag=True)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ── Main Run ─────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+
+    def run(self):
+        print(BANNER)
+
+        # ── Remote mode ───────────────────────────────────────────────────
+        if self.args.remote:
+            self._solve_remote()
+            self._finish()
+            return
+
+        # ── Load data ─────────────────────────────────────────────────────
+        raw, raw_bytes = self.load_input()
+        if not raw and not raw_bytes:
+            cprint("ERROR: No input provided. Use -f, -c, or -r.", Colors.RED)
+            sys.exit(1)
+
+        cprint(f"\n  Input length: {len(raw_bytes)} bytes | Preview: {raw[:60]!r}", Colors.BLUE)
+
+        # ── Forced type mode ──────────────────────────────────────────────
+        forced_type = self.args.type
+        if forced_type:
+            cprint(f"\n  Forced type: {forced_type}", Colors.PURPLE, bold=True)
+            ft = forced_type.lower()
+            if ft in ("base64", "base32", "base16", "hex", "binary", "morse", "url",
+                      "base58", "rot13", "atbash", "binary"):
+                section(f"ENCODING ({ft.upper()})")
+                result = decode_by_type(raw, ft)
+                if result:
+                    self._record(ft, result)
+            elif ft == "rsa":
+                self._solve_rsa(raw, raw_bytes)
+            elif ft == "aes":
+                self._solve_aes(raw_bytes, raw)
+            elif ft in ("xor", "xor1", "xor-single"):
+                self._solve_xor(raw_bytes, raw)
+            elif ft in ("caesar", "vigenere", "affine", "classical"):
+                self._solve_classical(raw)
+            elif ft in ("md5", "sha1", "sha256", "sha512", "hash"):
+                self._solve_hash(raw)
+            elif ft in ("ecc", "elliptic"):
+                self._solve_ecc(raw)
+            elif ft in ("dh", "diffie-hellman"):
+                self._solve_dh(raw)
+            else:
+                cprint(f"  Unknown type '{ft}', running auto-detect", Colors.YELLOW)
+                self._try_everything(raw, raw_bytes)
+        else:
+            self._try_everything(raw, raw_bytes)
+
+        self._finish()
+
+    def _finish(self):
+        elapsed = time.time() - self.start_time
+        section(f"SUMMARY  ({elapsed:.2f}s)")
+        cprint(f"  Total results:   {len(self.results)}", Colors.BLUE)
+        cprint(f"  Flags found:     {len(self.flags)}", Colors.GREEN if self.flags else Colors.RED)
+        if self.flags:
+            print_flag(self.flags)
+        else:
+            cprint("\n  No flags automatically found.", Colors.YELLOW)
+            cprint("  Try --verbose for all results, or specify -t <type>.", Colors.YELLOW)
+        self._save_output()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ── CLI Argument Parser ──────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="Crypto-shail.py",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=textwrap.dedent("""\
+            CryptoCTF Solver — Automatic flag extraction from crypto challenges
+            ──────────────────────────────────────────────────────────────────
+            Examples:
+              python Crypto-shail.py -f ciphertext.txt
+              python Crypto-shail.py -c "SGVsbG8gV29ybGQ="
+              python Crypto-shail.py -r ctf.example.com:1337
+              python Crypto-shail.py -f rsa.txt -t rsa -e 3
+              python Crypto-shail.py -f hash.txt --wordlist rockyou.txt
+              python Crypto-shail.py -f ct.bin -t xor --crib "flag{"
+        """),
+    )
+
+    # ── Input ──────────────────────────────────────────────────────────────
+    inp = parser.add_argument_group("Input")
+    inp_ex = inp.add_mutually_exclusive_group()
+    inp_ex.add_argument("-f", "--file",   metavar="FILE",    help="Input file")
+    inp_ex.add_argument("-c", "--ciphertext", metavar="TEXT", help="Inline ciphertext")
+    inp_ex.add_argument("-r", "--remote", metavar="HOST:PORT", help="Connect to CTF service")
+    inp.add_argument("--extra", nargs="+", metavar="FILE",
+                     help="Extra ciphertext files (Hastad / many-time pad)")
+
+    # ── Attack type override ───────────────────────────────────────────────
+    atk = parser.add_argument_group("Attack selection")
+    atk.add_argument("-t", "--type", metavar="TYPE",
+                     help=("Force attack type: rsa|aes|xor|caesar|vigenere|affine|"
+                           "classical|base64|base32|hex|binary|morse|md5|sha1|sha256|"
+                           "hash|ecc|dh|url|rot13|atbash|base58"))
+
+    # ── RSA parameters ─────────────────────────────────────────────────────
+    rsa = parser.add_argument_group("RSA parameters")
+    rsa.add_argument("-n", dest="n", metavar="N",  help="RSA modulus")
+    rsa.add_argument("-e", dest="e", metavar="E",  help="RSA public exponent")
+    rsa.add_argument("--cipher", dest="c", metavar="C", help="RSA ciphertext (integer)")
+    rsa.add_argument("-p", dest="p", metavar="P",  help="RSA prime p")
+    rsa.add_argument("-q", dest="q", metavar="Q",  help="RSA prime q")
+    rsa.add_argument("-d", dest="d", metavar="D",  help="RSA private exponent d")
+
+    # ── AES parameters ─────────────────────────────────────────────────────
+    aes_grp = parser.add_argument_group("AES parameters")
+    aes_grp.add_argument("--key",  metavar="HEX",  help="AES key (hex)")
+    aes_grp.add_argument("--iv",   metavar="HEX",  help="AES IV (hex)")
+    aes_grp.add_argument("--mode", metavar="MODE", help="AES mode: ECB|CBC|CTR|GCM")
+
+    # ── XOR parameters ─────────────────────────────────────────────────────
+    xor_grp = parser.add_argument_group("XOR parameters")
+    xor_grp.add_argument("--crib", metavar="TEXT", help="Known plaintext crib for XOR")
+
+    # ── Hash parameters ────────────────────────────────────────────────────
+    hsh = parser.add_argument_group("Hash cracking")
+    hsh.add_argument("--wordlist", metavar="FILE", help="Wordlist for hash cracking")
+    hsh.add_argument("--brute-len", type=int, default=5, metavar="N",
+                     help="Max brute-force length (default: 5)")
+    hsh.add_argument("--offline",  action="store_true",
+                     help="Disable online hash lookup")
+
+    # ── Flag options ───────────────────────────────────────────────────────
+    flg = parser.add_argument_group("Flag options")
+    flg.add_argument("--flag-pattern", metavar="REGEX",
+                     help="Custom flag regex pattern (default: flag{...})")
+
+    # ── Remote options ─────────────────────────────────────────────────────
+    rem = parser.add_argument_group("Remote options")
+    rem.add_argument("--rounds", type=int, default=50,
+                     help="Max remote interaction rounds (default: 50)")
+
+    # ── Output / verbosity ─────────────────────────────────────────────────
+    out = parser.add_argument_group("Output")
+    out.add_argument("-v", "--verbose", action="store_true",
+                     help="Show all intermediate results (not just flags)")
+    out.add_argument("-o", "--output",  metavar="FILE",
+                     help="Save results to file")
+    out.add_argument("--log-level", default="WARNING",
+                     choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                     help="Logging verbosity (default: WARNING)")
+
+    return parser
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ── Entry Point ──────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    # Configure logging
+    log_level = logging.DEBUG if args.verbose else getattr(logging, args.log_level)
+    logging.basicConfig(
+        level=log_level,
+        format="%(levelname)s  %(name)s  %(message)s",
+        stream=sys.stderr,
+    )
+
+    if not any([args.file, args.ciphertext, args.remote]):
+        parser.print_help()
+        sys.exit(0)
+
+    solver = CryptoCTFSolver(args)
+    try:
+        solver.run()
+    except KeyboardInterrupt:
+        cprint("\n\n  Interrupted by user", Colors.YELLOW)
+        solver._finish()
+    except Exception as e:
+        cprint(f"\nFATAL ERROR: {e}", Colors.RED)
+        if args.verbose:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
+
+    sys.exit(0 if solver.flags else 2)
+
+
+if __name__ == "__main__":
+    main()
