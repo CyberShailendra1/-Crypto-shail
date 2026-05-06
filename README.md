@@ -30,26 +30,26 @@ A production-ready, extensible Python tool that **auto-detects** encryption type
 
 ```bash
 git clone https://github.com/cybershailendra1/Crypto-shail
-cd cryptoctf-solver
-pip install -r requirements.txt
+cd Crypto-shail
+
 
 # Auto-detect and solve
 python crypto_solver.py -f ciphertext.txt
 
 # Inline ciphertext
-python crypto_solver.py -c "SGVsbG8gV29ybGQ="
+python Crypto-shail.py -c "SGVsbG8gV29ybGQ="
 
 # Connect to remote service
-python crypto_solver.py -r ctf.example.com:1337
+python Crypto-shail.py -r ctf.example.com:1337
 
 # Force RSA attack with known e
-python crypto_solver.py -f rsa.txt -t rsa -e 3
+python Crypto-shail.py -f rsa.txt -t rsa -e 3
 
 # Hash cracking with wordlist
-python crypto_solver.py -f hash.txt --wordlist /path/to/rockyou.txt
+python Crypto-shail.py -f hash.txt --wordlist /path/to/rockyou.txt
 
 # XOR with known crib
-python crypto_solver.py -f ct.bin -t xor --crib "flag{"
+python Crypto-shail.py -f ct.bin -t xor --crib "flag{"
 ```
 
 ---
